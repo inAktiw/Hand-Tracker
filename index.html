@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Hand Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    .container {
+      position: relative;
+      width: 640px;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    video {
+      width: 100%;
+      display: block;
+      transform: scaleX(-1);
+    }
+    /* overlay canvas for neon effects */
+    #cv {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+    }
+    /* drawing canvas sits on top, persists strokes */
+    #drawCv {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+    }
+    #msg {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%,-50%);
+      color: #fff;
+      font-family: sans-serif;
+      font-size: 15px;
+      text-align: center;
+      pointer-events: none;
+    }
+    #modeLabel {
+      position: absolute;
+      top: 12px; left: 50%;
+      transform: translateX(-50%);
+      font-family: sans-serif;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 4px 14px;
+      border-radius: 20px;
+      pointer-events: none;
+      transition: background 0.3s;
+    }
+    #penIndicator {
+      position: absolute;
+      bottom: 14px; right: 14px;
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      border: 2px solid #fff;
+      pointer-events: none;
+      display: none;
+    }
+    #clearBtn {
+      position: absolute;
+      bottom: 14px; left: 14px;
+      font-family: sans-serif;
+      font-size: 12px;
+      color: rgba(255,255,255,0.6);
+      background: rgba(255,255,255,0.1);
+      border: none;
+      border-radius: 8px;
+      padding: 5px 10px;
+      cursor: pointer;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <video id="vid" autoplay muted playsinline></video>
+    <canvas id="cv"></canvas>
+    <canvas id="drawCv"></canvas>
+    <div id="msg">Loading hand tracker...</div>
+    <div id="modeLabel">✦ Neon</div>
+    <div id="penIndicator"></div>
+    <button id="clearBtn" onclick="clearDrawing()">✕ Clear</button>
+  </div>
+
+  <script>
+    const vid       = document.getElementById('vid');
+    const cv        = document.getElementById('cv');
+    const ctx       = cv.getContext('2d');
+    const drawCv    = document.getElementById('drawCv');
+    const drawCtx   = drawCv.getContext('2d');
+    const msg       = document.getElementById('msg');
+    const modeLabel = document.getElementById('modeLabel');
+    const penInd    = document.getElementById('penIndicator');
+    const clearBtn  = document.getElementById('clearBtn');
+
+    // ── constants ─────────────────────────────────────────────
+    const COOL_COLORS = [
+      '#00cfff','#7b2fff','#00aaff',
+      '#aa44ff','#0066ff','#cc00ff',
+      '#44eeff','#9900ff'
+    ];
+
+    const PEN_COLORS = [
+      '#ff4488','#00cfff','#00ff99',
+      '#ffcc00','#ff6600','#aa44ff',
+      '#ffffff','#ff0055','__eraser__'
+    ];
+
+    const GESTURE_COLORS = {
+      fist:     { stroke: '#ff0055', glow: '#ff0055' },
+      peace:    { stroke: '#00ffaa', glow: '#00ffaa' },
+      thumbsup: { stroke: '#ffcc00', glow: '#ffcc00' },
+      open:     { stroke: '#00cfff', glow: '#7b2fff' },
+      none:     { stroke: null,      glow: null      }
+    };
+
+    const FINGER_TIPS = [4, 8, 12, 16, 20];
+    const FINGER_BASE = [2, 5,  9, 13, 17];
+    const ALL_TIPS    = [4, 8, 12, 16, 20];
+
+    const CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [0,9],[9,10],[10,11],[11,12],
+      [0,13],[13,14],[14,15],[15,16],
+      [0,17],[17,18],[18,19],[19,20],
+      [5,9],[9,13],[13,17]
+    ];
+
+    // ── state ─────────────────────────────────────────────────
+    let mode           = 0;   // 0 = neon, 1 = draw
+    let particles      = [];
+    let penColorIdx    = 0;
+    let isPenDown      = false;
+    let lastPenX       = null;
+    let lastPenY       = null;
+    let drawWidth       = 640;
+    let drawHeight      = 480;
+
+    // mode switch debounce
+    let joinCooldown   = false;
+    let joinFrames     = 0;
+    const JOIN_THRESH  = 0.06; // normalized distance to count as "touching"
+    const JOIN_FRAMES  = 12;   // frames fingers must stay touching
+
+    // left pinch cooldown for color change
+    let leftPinchWas   = false;
+
+    // ── helpers ───────────────────────────────────────────────
+    function px(lm, W, H) {
+      return { x: (1 - lm.x) * W, y: lm.y * H };
+    }
+
+    function dist(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function normDist(lmA, lmB) {
+      return Math.hypot(lmA.x - lmB.x, lmA.y - lmB.y);
+    }
+
+    function clearDrawing() {
+      drawCtx.clearRect(0, 0, drawCv.width, drawCv.height);
+    }
+
+    function setMode(m) {
+      mode = m;
+      clearDrawing();
+      if (mode === 0) {
+        modeLabel.textContent = '✦ Neon';
+        modeLabel.style.background = 'rgba(0,150,255,0.25)';
+        modeLabel.style.color = '#00cfff';
+        penInd.style.display  = 'none';
+        clearBtn.style.display = 'none';
+      } else {
+        modeLabel.textContent = '✦ Draw';
+        modeLabel.style.background = 'rgba(255,100,180,0.2)';
+        modeLabel.style.color = '#ff88cc';
+        penInd.style.display    = 'block';
+        clearBtn.style.display  = 'block';
+        const isEraser = PEN_COLORS[penColorIdx] === '__eraser__';
+        penInd.style.background = isEraser ? '#222' : PEN_COLORS[penColorIdx];
+        penInd.style.boxShadow  = isEraser ? '0 0 8px #fff' : `0 0 8px ${PEN_COLORS[penColorIdx]}`;
+      }
+    }
+
+    // ── particles ─────────────────────────────────────────────
+    function spawnParticle(x, y, color) {
+      particles.push({
+        x, y,
+        vx: (Math.random() - 0.5) * 3,
+        vy: (Math.random() - 0.5) * 3,
+        alpha: 1,
+        radius: Math.random() * 3 + 1,
+        color
+      });
+    }
+
+    function updateParticles() {
+      particles = particles.filter(p => p.alpha > 0.02);
+      particles.forEach(p => {
+        p.x += p.vx; p.y += p.vy;
+        p.alpha  -= 0.03;
+        p.radius *= 0.96;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fillStyle   = p.color;
+        ctx.globalAlpha = p.alpha;
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur  = 8;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      });
+      ctx.shadowBlur = 0;
+    }
+
+    // ── gesture ───────────────────────────────────────────────
+    function detectGesture(lm) {
+      const extended = FINGER_TIPS.map((tip, i) => lm[tip].y < lm[FINGER_BASE[i]].y);
+      const [thumbUp, indexUp, middleUp, ringUp, pinkyUp] = extended;
+      const allDown = !indexUp && !middleUp && !ringUp && !pinkyUp;
+      const allUp   =  indexUp &&  middleUp &&  ringUp &&  pinkyUp;
+      if (allDown && !thumbUp)                                     return 'fist';
+      if (indexUp && middleUp && !ringUp && !pinkyUp)              return 'peace';
+      if (thumbUp && !indexUp && !middleUp && !ringUp && !pinkyUp) return 'thumbsup';
+      if (allUp)                                                   return 'open';
+      return 'none';
+    }
+
+    // is thumb and index pinching? separate thresholds for each hand
+    function isPinching(lm, isRightHand) {
+      const threshold = isRightHand ? 0.05 : 0.10;
+      return normDist(lm[4], lm[8]) < threshold;
+    }
+
+    // ── neon drawing ──────────────────────────────────────────
+    function drawNeon(handsData, W, H) {
+      handsData.forEach(({ lm, gesture }, handIndex) => {
+        const gc    = GESTURE_COLORS[gesture];
+        const useGC = gc.stroke !== null;
+
+        CONNECTIONS.forEach(([a, b], i) => {
+          const baseCol = COOL_COLORS[(i + handIndex * 4) % COOL_COLORS.length];
+          const col     = useGC ? gc.stroke : baseCol;
+          const p1 = px(lm[a], W, H);
+          const p2 = px(lm[b], W, H);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.strokeStyle = col;
+          ctx.shadowColor = useGC ? gc.glow : col;
+          ctx.shadowBlur  = 25;
+          ctx.lineWidth   = 4;
+          ctx.lineCap     = 'round';
+          ctx.stroke();
+        });
+
+        lm.forEach((pt, i) => {
+          const p = px(pt, W, H);
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, i === 0 ? 7 : 4, 0, Math.PI * 2);
+          ctx.fillStyle   = '#ffffff';
+          ctx.shadowColor = '#ffffff';
+          ctx.shadowBlur  = 12;
+          ctx.fill();
+          if (FINGER_TIPS.includes(i) && Math.random() < 0.4) {
+            const col = useGC ? gc.stroke : COOL_COLORS[Math.floor(Math.random() * COOL_COLORS.length)];
+            spawnParticle(p.x, p.y, col);
+          }
+        });
+
+        const wrist     = px(lm[0], W, H);
+        const pinkyBase = px(lm[17], W, H);
+        const cx2       = (wrist.x + pinkyBase.x) / 2;
+        const cy2       = (wrist.y + pinkyBase.y) / 2;
+        const r         = Math.hypot(wrist.x - pinkyBase.x, wrist.y - pinkyBase.y) * 0.6;
+        const circleCol = useGC ? gc.stroke : COOL_COLORS[handIndex % COOL_COLORS.length];
+        ctx.beginPath();
+        ctx.arc(cx2, cy2, r, 0, Math.PI * 2);
+        ctx.strokeStyle = circleCol;
+        ctx.shadowColor = circleCol;
+        ctx.shadowBlur  = 30;
+        ctx.lineWidth   = 2;
+        ctx.stroke();
+      });
+
+      // cross-hand lines
+      if (handsData.length === 2) {
+        const h1 = handsData[0];
+        const h2 = handsData[1];
+        const t  = Date.now() / 300;
+        let lineIndex = 0;
+        ALL_TIPS.forEach((tip1, fi) => {
+          ALL_TIPS.forEach((tip2) => {
+            const p1  = px(h1.lm[tip1], W, H);
+            const p2  = px(h2.lm[tip2], W, H);
+            const col = COOL_COLORS[Math.floor(t + lineIndex) % COOL_COLORS.length];
+            [18, 10, 4].forEach((blur, pass) => {
+              ctx.beginPath();
+              ctx.moveTo(p1.x, p1.y);
+              ctx.lineTo(p2.x, p2.y);
+              ctx.strokeStyle = col;
+              ctx.shadowColor = col;
+              ctx.shadowBlur  = blur;
+              ctx.lineWidth   = pass === 0 ? 3 : pass === 1 ? 1.8 : 1;
+              ctx.globalAlpha = pass === 0 ? 0.3 : pass === 1 ? 0.7 : 1;
+              ctx.lineCap     = 'round';
+              ctx.stroke();
+            });
+            ctx.globalAlpha = 1;
+            lineIndex++;
+          });
+        });
+      }
+    }
+
+    // ── draw mode overlay (skeleton hint, no particles) ───────
+    function drawSkeletonHint(handsData, W, H) {
+      handsData.forEach(({ lm }, handIndex) => {
+        // draw faint skeleton so you can see your hands
+        CONNECTIONS.forEach(([a, b]) => {
+          const p1 = px(lm[a], W, H);
+          const p2 = px(lm[b], W, H);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+          ctx.shadowBlur  = 0;
+          ctx.lineWidth   = 1.5;
+          ctx.lineCap     = 'round';
+          ctx.stroke();
+        });
+
+        // highlight pinch fingers
+        const thumbPt = px(lm[4], W, H);
+        const indexPt = px(lm[8], W, H);
+        const pinching = isPinching(lm, false);
+        const dotCol   = pinching ? PEN_COLORS[penColorIdx] : 'rgba(255,255,255,0.4)';
+        [thumbPt, indexPt].forEach(p => {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, pinching ? 7 : 4, 0, Math.PI * 2);
+          ctx.fillStyle   = dotCol;
+          ctx.shadowColor = dotCol;
+          ctx.shadowBlur  = pinching ? 15 : 0;
+          ctx.fill();
+        });
+      });
+      ctx.shadowBlur = 0;
+    }
+
+    // ── handle drawing strokes ─────────────────────────────────
+    function handleDrawing(handsData, W, H) {
+      let rightHand = null;
+      let leftHand  = null;
+
+      handsData.forEach(h => {
+        if (h.isUserRight) rightHand = h.lm;
+        else               leftHand  = h.lm;
+      });
+
+      // if only one hand detected use it as right (drawing) hand
+      if (!rightHand && !leftHand && handsData.length === 1) {
+        rightHand = handsData[0].lm;
+      }
+
+      // left hand pinch = change color (on release)
+      if (leftHand) {
+        const leftPinching = isPinching(leftHand, false);
+        if (leftPinching && !leftPinchWas) {
+          penColorIdx = (penColorIdx + 1) % PEN_COLORS.length;
+          const isEraser = PEN_COLORS[penColorIdx] === '__eraser__';
+          penInd.style.background = isEraser ? '#222' : PEN_COLORS[penColorIdx];
+          penInd.style.boxShadow  = isEraser ? '0 0 10px #fff' : `0 0 10px ${PEN_COLORS[penColorIdx]}`;
+          penInd.textContent      = isEraser ? '⌫' : '';
+          penInd.style.color      = '#fff';
+          penInd.style.fontSize   = '12px';
+          penInd.style.textAlign  = 'center';
+          penInd.style.lineHeight = '22px';
+        }
+        leftPinchWas = leftPinching;
+      } else {
+        leftPinchWas = false;
+      }
+
+      // right hand pinch = pen down
+      if (rightHand) {
+        const pinching = isPinching(rightHand, true);
+        // pen position = midpoint of thumb and index tip
+        const thumbPt = px(rightHand[4], W, H);
+        const indexPt = px(rightHand[8], W, H);
+        const penX = (thumbPt.x + indexPt.x) / 2;
+        const penY = (thumbPt.y + indexPt.y) / 2;
+
+        if (pinching) {
+          const isEraser = PEN_COLORS[penColorIdx] === '__eraser__';
+          const col = isEraser ? null : PEN_COLORS[penColorIdx];
+
+          if (!isPenDown) {
+            isPenDown = true;
+            lastPenX  = penX;
+            lastPenY  = penY;
+          } else {
+            drawCtx.beginPath();
+            drawCtx.moveTo(lastPenX, lastPenY);
+            drawCtx.lineTo(penX, penY);
+            if (isEraser) {
+              drawCtx.globalCompositeOperation = 'destination-out';
+              drawCtx.strokeStyle = 'rgba(0,0,0,1)';
+              drawCtx.shadowBlur  = 0;
+              drawCtx.lineWidth   = 32;
+            } else {
+              drawCtx.globalCompositeOperation = 'source-over';
+              drawCtx.strokeStyle = col;
+              drawCtx.shadowColor = col;
+              drawCtx.shadowBlur  = 18;
+              drawCtx.lineWidth   = 3.5;
+            }
+            drawCtx.lineCap  = 'round';
+            drawCtx.lineJoin = 'round';
+            drawCtx.stroke();
+            drawCtx.globalCompositeOperation = 'source-over';
+          }
+          lastPenX = penX;
+          lastPenY = penY;
+        } else {
+          if (isPenDown) {
+            // lift pen — finish stroke
+            drawCtx.shadowBlur = 0;
+          }
+          isPenDown = false;
+          lastPenX  = null;
+          lastPenY  = null;
+        }
+      } else {
+        isPenDown = false;
+      }
+    }
+
+    // ── check mode switch (index tips touching) ────────────────
+    function checkModeSwitch(handsData) {
+      if (handsData.length < 2) {
+        joinFrames = 0;
+        return;
+      }
+      const tip1 = handsData[0].lm[8];
+      const tip2 = handsData[1].lm[8];
+      const d    = normDist(tip1, tip2);
+
+      if (d < JOIN_THRESH) {
+        joinFrames++;
+        if (joinFrames === JOIN_FRAMES && !joinCooldown) {
+          // switch mode
+          setMode(mode === 0 ? 1 : 0);
+          joinCooldown = true;
+          setTimeout(() => { joinCooldown = false; }, 1200);
+        }
+      } else {
+        joinFrames = 0;
+      }
+    }
+
+    // ── main draw loop ─────────────────────────────────────────
+    function drawHands(results) {
+      const W = vid.videoWidth  || 640;
+      const H = vid.videoHeight || 480;
+
+      // only resize cv (neon canvas) every frame — it's cleared anyway
+      if (cv.width !== W)  cv.width  = W;
+      if (cv.height !== H) cv.height = H;
+
+      // only resize drawCv ONCE — resizing wipes its contents
+      if (drawCv.width !== W || drawCv.height !== H) {
+        drawCv.width  = W;
+        drawCv.height = H;
+      }
+
+      drawWidth  = W;
+      drawHeight = H;
+
+      ctx.clearRect(0, 0, W, H);
+      updateParticles();
+
+      if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) return;
+
+      // use MediaPipe's own handedness labels — much more reliable than guessing by position
+      // note: MediaPipe labels are flipped relative to mirrored view, so "Right" = user's left on screen
+      const handsData = results.multiHandLandmarks.map((lm, i) => {
+        const label = results.multiHandedness[i]?.label || 'Right';
+        // because video is mirrored, MediaPipe's "Right" = user's actual left hand
+        const isUserRight = label === 'Left';
+        return { lm, gesture: detectGesture(lm), isUserRight };
+      });
+
+      checkModeSwitch(handsData);
+
+      if (mode === 0) {
+        drawNeon(handsData, W, H);
+      } else {
+        drawSkeletonHint(handsData, W, H);
+        handleDrawing(handsData, W, H);
+      }
+
+      ctx.shadowBlur = 0;
+    }
+
+    // ── init ───────────────────────────────────────────────────
+    async function init() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        vid.srcObject = stream;
+        await vid.play();
+
+        const hands = new Hands({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+        });
+        hands.setOptions({
+          maxNumHands: 2,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.7,
+          minTrackingConfidence: 0.5
+        });
+        hands.onResults(drawHands);
+
+        const camera = new Camera(vid, {
+          onFrame: async () => { await hands.send({ image: vid }); },
+          width: 640, height: 480
+        });
+        camera.start();
+        msg.style.display = 'none';
+        setMode(1);
+
+      } catch(e) {
+        msg.textContent = 'Camera access denied. Please allow camera and reload.';
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
