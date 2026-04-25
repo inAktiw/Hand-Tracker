@@ -455,34 +455,33 @@
     }
 
     // ── check X gesture (index fingers crossing) ──────────────
-    // an X = index fingers extended and crossing each other
-    // we detect crossing by checking if h1's index tip is on the opposite
-    // side of h2's index base vs h2's index tip
     function checkXClear(handsData) {
       if (mode !== 1 || handsData.length < 2) { xClearFrames = 0; return; }
 
       const h1 = handsData[0].lm;
       const h2 = handsData[1].lm;
 
-      // index tips and mid points
-      const tip1 = h1[8];  const mid1 = h1[6];
-      const tip2 = h2[8];  const mid2 = h2[6];
-
       // both index fingers must be extended
       const idx1Up = h1[8].y < h1[5].y;
       const idx2Up = h2[8].y < h2[5].y;
       if (!idx1Up || !idx2Up) { xClearFrames = 0; return; }
 
-      // check crossing: tip of finger 1 is on opposite side of tip of finger 2
-      // relative to the line connecting their bases
-      // simpler heuristic: the two tips are close and the two mids cross
-      const tipDist  = normDist(tip1, tip2);
-      const midDist  = normDist(mid1, mid2);
+      // get index finger segments as lines:
+      // h1: base(5) -> tip(8), h2: base(5) -> tip(8)
+      // crossing = tip of h1 is on opposite x-side of h2's base vs h2's tip
+      // i.e. h1 tip x < h2 base x  AND  h2 tip x > h1 base x  (or vice versa)
+      const h1base = h1[5].x;  const h1tip = h1[8].x;
+      const h2base = h2[5].x;  const h2tip = h2[8].x;
 
-      // tips are near each other but mids are far = crossing
-      const isCrossing = tipDist < 0.12 && midDist > 0.08;
+      // fingers cross if their x-coordinates swap between base and tip
+      const cross1 = (h1tip < h2tip && h1base > h2base);
+      const cross2 = (h1tip > h2tip && h1base < h2base);
+      const isCrossing = cross1 || cross2;
 
-      if (isCrossing) {
+      // also make sure the fingers are in the same vertical region (not just parallel)
+      const verticalOverlap = Math.abs(h1[8].y - h2[8].y) < 0.15;
+
+      if (isCrossing && verticalOverlap) {
         xClearFrames++;
         if (xClearFrames >= X_FRAMES && !xClearCooldown) {
           clearDrawing();
