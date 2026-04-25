@@ -16,7 +16,7 @@
     }
     .container {
       position: relative;
-      width: 900px;
+      width: 640px;
       background: #000;
       border-radius: 12px;
       overflow: hidden;
@@ -158,6 +158,11 @@
 
     // left pinch cooldown for color change
     let leftPinchWas   = false;
+
+    // X gesture clear
+    let xClearCooldown = false;
+    let xClearFrames   = 0;
+    const X_FRAMES     = 10;
 
     // ── helpers ───────────────────────────────────────────────
     function px(lm, W, H) {
@@ -449,7 +454,46 @@
       }
     }
 
-    // ── check mode switch (index tips touching) ────────────────
+    // ── check X gesture (index fingers crossing) ──────────────
+    // an X = index fingers extended and crossing each other
+    // we detect crossing by checking if h1's index tip is on the opposite
+    // side of h2's index base vs h2's index tip
+    function checkXClear(handsData) {
+      if (mode !== 1 || handsData.length < 2) { xClearFrames = 0; return; }
+
+      const h1 = handsData[0].lm;
+      const h2 = handsData[1].lm;
+
+      // index tips and mid points
+      const tip1 = h1[8];  const mid1 = h1[6];
+      const tip2 = h2[8];  const mid2 = h2[6];
+
+      // both index fingers must be extended
+      const idx1Up = h1[8].y < h1[5].y;
+      const idx2Up = h2[8].y < h2[5].y;
+      if (!idx1Up || !idx2Up) { xClearFrames = 0; return; }
+
+      // check crossing: tip of finger 1 is on opposite side of tip of finger 2
+      // relative to the line connecting their bases
+      // simpler heuristic: the two tips are close and the two mids cross
+      const tipDist  = normDist(tip1, tip2);
+      const midDist  = normDist(mid1, mid2);
+
+      // tips are near each other but mids are far = crossing
+      const isCrossing = tipDist < 0.12 && midDist > 0.08;
+
+      if (isCrossing) {
+        xClearFrames++;
+        if (xClearFrames >= X_FRAMES && !xClearCooldown) {
+          clearDrawing();
+          xClearCooldown = true;
+          setTimeout(() => { xClearCooldown = false; }, 1500);
+          xClearFrames = 0;
+        }
+      } else {
+        xClearFrames = 0;
+      }
+    }
     function checkModeSwitch(handsData) {
       if (handsData.length < 2) {
         joinFrames = 0;
@@ -505,6 +549,7 @@
       });
 
       checkModeSwitch(handsData);
+      checkXClear(handsData);
 
       if (mode === 0) {
         drawNeon(handsData, W, H);
@@ -536,7 +581,7 @@
 
         const camera = new Camera(vid, {
           onFrame: async () => { await hands.send({ image: vid }); },
-          width: 900, height: 675
+          width: 640, height: 480
         });
         camera.start();
         msg.style.display = 'none';
